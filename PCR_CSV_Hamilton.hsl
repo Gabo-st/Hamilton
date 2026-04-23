@@ -1,0 +1,564 @@
+// ============================================================
+//  PCR_CSV_Hamilton.hsl
+//  Hamilton STAR / STARlet – Venus 4.4+
+//
+//  Ported from: Customizable PCR (CSV)
+//  Original author: Gabriel Straface (Ignea Lab @ McGill University)
+//
+//  Description:
+//    Distributes master mix and template DNA from 1.5 mL Eppendorf
+//    tubes to a subset of wells on a 96-well PCR plate, then runs
+//    a user-defined thermocycler program on an on-deck Inheco ODTC.
+//
+//    Well targets are read from a plain CSV file at run time
+//    (columns, rows, and/or individual well names – same format
+//    as the Opentrons version).
+//
+//  Deck layout (STARlet, tracks 1-30):
+//    Tracks  1-6  : TIP_CAR_480_A00  →  4× HTF 1000 µL filter tips
+//    Tracks  7-9  : SMP_CAR_24_A00   →  24-position 1.5 mL tube rack
+//    Tracks 10-15 : MTP_CAR_P3_A00   →  PCR plate (site 1)
+//    Tracks 16-19 : ODTC carrier     →  Inheco ODTC 96 (on-deck thermocycler)
+//
+//  Reagent map (tube rack, site 1):
+//    A1 = Master mix
+//    A2 = Template DNA / sample
+//
+//  Parameters (all prompted via User Dialog at run start):
+//    PARAM_CSV_PATH            – full path to well-list CSV
+//    PARAM_MMX_VOL             – master mix volume per well  (µL)
+//    PARAM_DNA_VOL             – template DNA volume per well (µL)
+//    PARAM_DENAT_TEMP          – denaturation temperature (°C)
+//    PARAM_ANNEAL_TEMP         – annealing temperature (°C)
+//    PARAM_EXT_TEMP            – extension temperature (°C)
+//    PARAM_INIT_DENAT_TIME     – initial denaturation hold (s)
+//    PARAM_DENAT_TIME          – per-cycle denaturation hold (s)
+//    PARAM_ANNEAL_TIME         – per-cycle annealing hold (s)
+//    PARAM_EXT_TIME            – per-cycle extension hold (s)
+//    PARAM_FINAL_EXT_TIME      – final extension hold (s)
+//    PARAM_NUM_CYCLES          – number of PCR cycles
+//    PARAM_COLONY_PCR          – 1 = colony PCR mode, 0 = standard
+//    PARAM_LYSIS_TEMP          – lysis temperature for colony PCR (°C)
+//    PARAM_LYSIS_TIME          – lysis hold time for colony PCR (s)
+//
+//  Liquid class used:
+//    "HighVolumeFilter_Water_DispenseJet_Empty"
+//    Clone this class and tune flow rates / correction curve for
+//    your specific master mix formulation before first use.
+//
+//  Notes:
+//    • This method uses a SINGLE tip per reagent (same as the
+//      Opentrons version) – one tip for master mix, one for DNA.
+//    • The pipetting loop iterates well-by-well; each cycle
+//      aspirates once from the source tube and dispenses once into
+//      the destination well.
+//    • ODTC control uses the standard Hamilton / Inheco
+//      HSLInhecoTEC library shipped with Venus.
+//    • Colony PCR lysis step is included; it is skipped when
+//      PARAM_COLONY_PCR = 0.
+// ============================================================
+
+// ── Include standard libraries ──────────────────────────────
+#include "HSLSeqLib.hsl"          // Sequence management
+#include "HSLStrLib.hsl"          // String utilities
+#include "HSLUtilLib.hsl"         // Timers, math
+#include "HSLTipCountingLib.hsl"  // Optional tip counting helpers
+#include "HSLInhecoTEC.hsl"       // Inheco ODTC thermocycler
+#include "HSLFileLib.hsl"         // File I/O (CSV reading)
+
+
+// ── Global variable declarations ────────────────────────────
+
+// --- User parameters (filled by PromptForInput) ---
+variable PARAM_CSV_PATH;
+variable PARAM_MMX_VOL;
+variable PARAM_DNA_VOL;
+variable PARAM_DENAT_TEMP;
+variable PARAM_ANNEAL_TEMP;
+variable PARAM_EXT_TEMP;
+variable PARAM_INIT_DENAT_TIME;
+variable PARAM_DENAT_TIME;
+variable PARAM_ANNEAL_TIME;
+variable PARAM_EXT_TIME;
+variable PARAM_FINAL_EXT_TIME;
+variable PARAM_NUM_CYCLES;
+variable PARAM_COLONY_PCR;
+variable PARAM_LYSIS_TEMP;
+variable PARAM_LYSIS_TIME;
+
+// --- Internal state ---
+variable i;           // loop counter
+variable j;           // inner loop counter
+variable strLine;     // one CSV line
+variable strToken;    // one CSV token
+variable wellName;    // resolved well name  e.g. "A1"
+variable wellIndex;   // 1-based position index within sequence
+
+// Well-list array (max 96 entries)
+variable arrWells[];          // dynamic array of well names
+variable nWells;              // number of resolved unique wells
+variable arrSeen[];           // deduplication flag array (size 96)
+
+// Temp variables for CSV parsing
+variable colToken;
+variable rowToken;
+variable wellToken;
+
+// File handle
+variable hFile;
+variable bEOF;
+
+
+// ── Sequence declarations (names match .lay file) ────────────
+//   These are declared here for clarity; Venus binds them to
+//   the physical deck positions defined in PCR_CSV_Hamilton.lay
+sequence seqTips_1;       // Tip rack 1 (HTF 1000 µL)
+sequence seqTips_2;       // Tip rack 2 (HTF 1000 µL)  – spare
+sequence seqMMX;          // Master mix tube (A1 of SMP_CAR_24)
+sequence seqDNA;          // Template DNA tube (A2 of SMP_CAR_24)
+sequence seqPCRPlate;     // Full 96-well PCR plate sequence
+sequence seqTarget;       // Working sequence – subset of seqPCRPlate
+
+
+// ============================================================
+//  MAIN METHOD
+// ============================================================
+method PCR_CSV_Hamilton()
+{
+    // ── 1. Collect run parameters from the operator ──────────
+    PromptForInput();
+
+    // ── 2. Parse the CSV and build seqTarget ─────────────────
+    ParseCSVAndBuildSequence();
+
+    // ── 3. Initialize the instrument ─────────────────────────
+    // Venus inserts auto-generated initialize step here when
+    // the method is opened in the Method Editor (leave blank).
+    // If scripting manually, call:
+    //   ML_STAR.Initialize();
+
+    // ── 4. Dispense master mix ───────────────────────────────
+    DispenseSingleReagent(
+        seqMMX,            // source
+        seqTarget,         // destination (subset sequence)
+        PARAM_MMX_VOL,     // volume µL
+        "Master mix",      // label for log
+        seqTips_1,         // tip rack to draw from
+        1                  // starting tip position (1-based)
+    );
+
+    // ── 5. Dispense template DNA ─────────────────────────────
+    DispenseSingleReagent(
+        seqDNA,
+        seqTarget,
+        PARAM_DNA_VOL,
+        "Template DNA",
+        seqTips_1,
+        2                  // second tip position
+    );
+
+    // ── 6. Run thermocycler program ──────────────────────────
+    RunThermocycler();
+
+    // ── 7. Done ──────────────────────────────────────────────
+    MessageBox("PCR protocol complete. Plate is held at 4°C.\nPress OK to deactivate the block.", 0);
+    HSLInhecoTEC.Deactivate();
+}
+
+
+// ============================================================
+//  SUBMETHOD: PromptForInput
+//  Collects all run parameters via Venus User Dialog steps.
+//  In Method Editor these become a sequence of User Input
+//  dialog visual steps; here they are written as HSL calls.
+// ============================================================
+submethod PromptForInput()
+{
+    // CSV path
+    PARAM_CSV_PATH = "C:\\Hamilton\\Methods\\well_list.csv";
+    InputBox(
+        "Enter full path to the well-list CSV file:",
+        "PCR CSV Setup",
+        PARAM_CSV_PATH,
+        PARAM_CSV_PATH
+    );
+
+    // Volumes
+    PARAM_MMX_VOL = 20;
+    InputBox("Master mix volume per well (µL, 10-100):", "PCR Setup",
+             PARAM_MMX_VOL, PARAM_MMX_VOL);
+
+    PARAM_DNA_VOL = 1;
+    InputBox("Template DNA / sample volume per well (µL, 1-25):", "PCR Setup",
+             PARAM_DNA_VOL, PARAM_DNA_VOL);
+
+    // Temperatures
+    PARAM_DENAT_TEMP   = 98;
+    PARAM_ANNEAL_TEMP  = 63;
+    PARAM_EXT_TEMP     = 72;
+    InputBox("Denaturation temperature (°C):", "Thermocycler",
+             PARAM_DENAT_TEMP,  PARAM_DENAT_TEMP);
+    InputBox("Annealing temperature (°C):",    "Thermocycler",
+             PARAM_ANNEAL_TEMP, PARAM_ANNEAL_TEMP);
+    InputBox("Extension temperature (°C):",    "Thermocycler",
+             PARAM_EXT_TEMP,    PARAM_EXT_TEMP);
+
+    // Hold times (seconds)
+    PARAM_INIT_DENAT_TIME  = 15;
+    PARAM_DENAT_TIME       = 30;
+    PARAM_ANNEAL_TIME      = 20;
+    PARAM_EXT_TIME         = 210;
+    PARAM_FINAL_EXT_TIME   = 120;
+    PARAM_NUM_CYCLES       = 30;
+    InputBox("Initial denaturation hold (s):", "Thermocycler",
+             PARAM_INIT_DENAT_TIME,  PARAM_INIT_DENAT_TIME);
+    InputBox("Per-cycle denaturation hold (s):", "Thermocycler",
+             PARAM_DENAT_TIME,  PARAM_DENAT_TIME);
+    InputBox("Per-cycle annealing hold (s):",    "Thermocycler",
+             PARAM_ANNEAL_TIME, PARAM_ANNEAL_TIME);
+    InputBox("Per-cycle extension hold (s):",    "Thermocycler",
+             PARAM_EXT_TIME,    PARAM_EXT_TIME);
+    InputBox("Final extension hold (s):",        "Thermocycler",
+             PARAM_FINAL_EXT_TIME, PARAM_FINAL_EXT_TIME);
+    InputBox("Number of PCR cycles:",            "Thermocycler",
+             PARAM_NUM_CYCLES, PARAM_NUM_CYCLES);
+
+    // Colony PCR
+    PARAM_COLONY_PCR = 0;
+    InputBox("Colony PCR? (1 = yes, 0 = no):", "PCR Setup",
+             PARAM_COLONY_PCR, PARAM_COLONY_PCR);
+
+    if (PARAM_COLONY_PCR == 1)
+    {
+        PARAM_LYSIS_TEMP = 98;
+        PARAM_LYSIS_TIME = 600;
+        InputBox("Lysis temperature (°C):", "Colony PCR",
+                 PARAM_LYSIS_TEMP, PARAM_LYSIS_TEMP);
+        InputBox("Lysis hold time (s):",    "Colony PCR",
+                 PARAM_LYSIS_TIME, PARAM_LYSIS_TIME);
+    }
+}
+
+
+// ============================================================
+//  SUBMETHOD: ParseCSVAndBuildSequence
+//
+//  Reads the CSV line by line.  Expected format (with header):
+//    columns,rows,wells
+//    1,,                  ← whole column 1
+//    ,B,                  ← whole row B
+//    ,,C3                 ← individual well C3
+//
+//  Resolves each entry to individual well names (e.g. "A1"),
+//  deduplicates, then appends the matching position from
+//  seqPCRPlate into seqTarget.
+//
+//  Hamilton well-position numbering (column-major, 1-based):
+//    A1=1, B1=2, … H1=8, A2=9, B2=10, … H12=96
+// ============================================================
+submethod ParseCSVAndBuildSequence()
+{
+    variable row_char;
+    variable col_num;
+    variable pos;        // 1-based position in the 96-well plate
+    variable r;          // row index 0-7
+    variable c;          // column index 0-11
+
+    // Initialise deduplication array (96 entries, all 0)
+    for (i = 0; i < 96; i++)
+    {
+        arrSeen[i] = 0;
+    }
+    nWells = 0;
+
+    // Open the CSV
+    hFile = HSLFileLib.Open(PARAM_CSV_PATH, "r");
+    if (hFile == 0)
+    {
+        MessageBox("ERROR: Cannot open CSV file:\n" + PARAM_CSV_PATH +
+                   "\nPlease check the path and try again.", 16);
+        AbortMethod();
+    }
+
+    // Skip header line
+    strLine = HSLFileLib.ReadLine(hFile, bEOF);
+
+    // Read data lines
+    strLine = HSLFileLib.ReadLine(hFile, bEOF);
+    while (!bEOF)
+    {
+        // Tokenize on comma → colToken, rowToken, wellToken
+        colToken  = HSLStrLib.Token(strLine, ",", 0);   // field index 0
+        rowToken  = HSLStrLib.Token(strLine, ",", 1);   // field index 1
+        wellToken = HSLStrLib.Token(strLine, ",", 2);   // field index 2
+
+        // Trim whitespace from each token
+        colToken  = HSLStrLib.Trim(colToken);
+        rowToken  = HSLStrLib.Trim(rowToken);
+        wellToken = HSLStrLib.Trim(wellToken);
+
+        // ---- Whole column  (colToken = "1".."12") ----
+        if (HSLStrLib.GetLength(colToken) > 0)
+        {
+            col_num = IVal(colToken);   // 1-based column number
+            for (r = 0; r < 8; r++)    // rows A-H (0-7)
+            {
+                pos = (col_num - 1) * 8 + r;   // 0-based flat index
+                if (arrSeen[pos] == 0)
+                {
+                    arrSeen[pos] = 1;
+                    // Build well name: row letter + column number
+                    wellName = Chr(65 + r) + colToken;
+                    arrWells[nWells] = wellName;
+                    nWells = nWells + 1;
+                }
+            }
+        }
+
+        // ---- Whole row  (rowToken = "A".."H") ----
+        if (HSLStrLib.GetLength(rowToken) > 0)
+        {
+            r = Asc(rowToken) - 65;    // 0-based row index
+            for (c = 0; c < 12; c++)   // columns 1-12
+            {
+                pos = c * 8 + r;       // 0-based flat index
+                if (arrSeen[pos] == 0)
+                {
+                    arrSeen[pos] = 1;
+                    wellName = rowToken + IStr(c + 1);
+                    arrWells[nWells] = wellName;
+                    nWells = nWells + 1;
+                }
+            }
+        }
+
+        // ---- Individual well  (wellToken = "A1", "H12", …) ----
+        if (HSLStrLib.GetLength(wellToken) > 0)
+        {
+            // Parse row letter and column number from wellToken
+            row_char = HSLStrLib.Mid(wellToken, 0, 1);          // e.g. "A"
+            col_num  = IVal(HSLStrLib.Mid(wellToken, 1, 10));   // e.g. 1
+            r   = Asc(row_char) - 65;
+            pos = (col_num - 1) * 8 + r;
+            if (arrSeen[pos] == 0)
+            {
+                arrSeen[pos] = 1;
+                arrWells[nWells] = wellToken;
+                nWells = nWells + 1;
+            }
+        }
+
+        strLine = HSLFileLib.ReadLine(hFile, bEOF);
+    }
+
+    HSLFileLib.Close(hFile);
+
+    if (nWells == 0)
+    {
+        MessageBox("ERROR: No valid wells found in CSV.\n" +
+                   "Check file format (header: columns,rows,wells).", 16);
+        AbortMethod();
+    }
+
+    // Build seqTarget from the resolved well list
+    // Reset target sequence to empty
+    SeqLib.SeqSetCount(seqTarget, 0);
+    SeqLib.SeqSetCurrentPosition(seqTarget, 1);
+
+    for (i = 0; i < nWells; i++)
+    {
+        // Find the matching position in the full-plate sequence
+        // seqPCRPlate must be sorted column-major (Venus default)
+        wellIndex = WellNameToIndex(arrWells[i]);  // 1-based
+        SeqLib.SeqAdd(seqTarget, "PCRPlate", arrWells[i]);
+    }
+
+    SeqLib.SeqSetCurrentPosition(seqTarget, 1);
+
+    // Log resolved wells for operator review
+    strLine = "Target wells (" + IStr(nWells) + "):\n";
+    for (i = 0; i < nWells; i++)
+    {
+        strLine = strLine + arrWells[i];
+        if (i < nWells - 1) { strLine = strLine + ", "; }
+    }
+    MessageBox(strLine, 0);
+}
+
+
+// ============================================================
+//  HELPER: WellNameToIndex
+//  Converts "A1" → 1, "B1" → 2, … "H12" → 96 (column-major)
+// ============================================================
+function WellNameToIndex(variable wellName) variable
+{
+    variable row_letter;
+    variable col_number;
+    row_letter = HSLStrLib.Mid(wellName, 0, 1);
+    col_number = IVal(HSLStrLib.Mid(wellName, 1, 10));
+    return (col_number - 1) * 8 + (Asc(row_letter) - 65) + 1;
+}
+
+
+// ============================================================
+//  SUBMETHOD: DispenseSingleReagent
+//
+//  Picks up ONE tip from the specified position in tipSeq,
+//  then iterates over every position in destSeq, aspirating
+//  from srcSeq once per destination well (same-tip multi-
+//  dispense as in the original Opentrons protocol).
+//
+//  Parameters:
+//    srcSeq    – sequence pointing to the reagent tube
+//    destSeq   – target well sequence (seqTarget)
+//    vol       – volume to aspirate/dispense per well (µL)
+//    label     – human-readable reagent name for log
+//    tipSeq    – tip rack sequence
+//    tipPos    – 1-based position of the tip to pick up
+// ============================================================
+submethod DispenseSingleReagent(
+    sequence srcSeq,
+    sequence destSeq,
+    variable vol,
+    variable label,
+    sequence tipSeq,
+    variable tipPos)
+{
+    variable destWell;
+    variable nDest;
+
+    // Move tip sequence pointer to the requested position
+    SeqLib.SeqSetCurrentPosition(tipSeq, tipPos);
+
+    // Pick up one tip (channel 1 only)
+    ML_STAR.Tip_Pick_Up(
+        tipSeq,
+        "HighVolumeFilter_Water_DispenseJet_Empty",
+        1,      // channel count = 1
+        0       // channel pattern: bit 0 = channel 1
+    );
+
+    // Reset destination sequence to beginning
+    SeqLib.SeqSetCurrentPosition(destSeq, 1);
+    nDest = SeqLib.SeqGetCount(destSeq);
+
+    // Loop over every destination well
+    for (i = 0; i < nDest; i++)
+    {
+        // Aspirate from source tube
+        SeqLib.SeqSetCurrentPosition(srcSeq, 1);
+        ML_STAR.Aspirate(
+            srcSeq,
+            vol,
+            "HighVolumeFilter_Water_DispenseJet_Empty",
+            1,          // channel count
+            0,          // channel pattern
+            0,          // liquid following: 0 = off (fixed height)
+                        // set to 1 to enable pLLD for tubes
+            2           // submerge depth 2 mm below fixed height
+        );
+
+        // Dispense into current destination well
+        ML_STAR.Dispense(
+            destSeq,
+            vol,
+            "HighVolumeFilter_Water_DispenseJet_Empty",
+            1,          // channel count
+            0,          // channel pattern
+            0,          // no mix after dispense (add if needed)
+            0,          // mix cycles
+            0           // mix volume
+        );
+
+        // Advance destination sequence to the next well
+        SeqLib.SeqSetCurrentPosition(
+            destSeq,
+            SeqLib.SeqGetCurrentPosition(destSeq) + 1
+        );
+    }
+
+    // Eject the tip to waste
+    ML_STAR.Tip_Eject(
+        tipSeq,
+        1,
+        0
+    );
+
+    Trace("Dispensed " + IStr(vol) + " µL of " + label +
+          " to " + IStr(nDest) + " wells.");
+}
+
+
+// ============================================================
+//  SUBMETHOD: RunThermocycler
+//  Controls the Inheco ODTC via HSLInhecoTEC.hsl.
+//  Call structure mirrors the Opentrons tc_mod API.
+// ============================================================
+submethod RunThermocycler()
+{
+    variable cycleIndex;
+
+    // Open lid (ODTC lid motor)
+    // Lid was already open during pipetting; this is a guard.
+    HSLInhecoTEC.OpenLid();
+
+    // Close lid and heat it to 105 °C before cycling
+    HSLInhecoTEC.CloseLid();
+    HSLInhecoTEC.SetLidTemperature(105);
+
+    // ---- Optional colony PCR lysis step ----
+    if (PARAM_COLONY_PCR == 1)
+    {
+        Trace("Colony PCR: Lysis at " + IStr(PARAM_LYSIS_TEMP) +
+              "°C for " + IStr(PARAM_LYSIS_TIME) + " s");
+        HSLInhecoTEC.SetTemperature(PARAM_LYSIS_TEMP);
+        HSLInhecoTEC.WaitForTemperature(PARAM_LYSIS_TEMP, 120); // 2 min ramp timeout
+        HSLUtilLib.Delay(PARAM_LYSIS_TIME);
+    }
+
+    // ---- Initial denaturation ----
+    Trace("Initial denaturation: " + IStr(PARAM_DENAT_TEMP) +
+          "°C for " + IStr(PARAM_INIT_DENAT_TIME) + " s");
+    HSLInhecoTEC.SetTemperature(PARAM_DENAT_TEMP);
+    HSLInhecoTEC.WaitForTemperature(PARAM_DENAT_TEMP, 120);
+    HSLUtilLib.Delay(PARAM_INIT_DENAT_TIME);
+
+    // ---- PCR cycles ----
+    Trace("Starting " + IStr(PARAM_NUM_CYCLES) + " PCR cycles");
+    for (cycleIndex = 1; cycleIndex <= PARAM_NUM_CYCLES; cycleIndex++)
+    {
+        // Denaturation
+        HSLInhecoTEC.SetTemperature(PARAM_DENAT_TEMP);
+        HSLInhecoTEC.WaitForTemperature(PARAM_DENAT_TEMP, 60);
+        HSLUtilLib.Delay(PARAM_DENAT_TIME);
+
+        // Annealing
+        HSLInhecoTEC.SetTemperature(PARAM_ANNEAL_TEMP);
+        HSLInhecoTEC.WaitForTemperature(PARAM_ANNEAL_TEMP, 60);
+        HSLUtilLib.Delay(PARAM_ANNEAL_TIME);
+
+        // Extension
+        HSLInhecoTEC.SetTemperature(PARAM_EXT_TEMP);
+        HSLInhecoTEC.WaitForTemperature(PARAM_EXT_TEMP, 60);
+        HSLUtilLib.Delay(PARAM_EXT_TIME);
+    }
+
+    // ---- Final extension ----
+    Trace("Final extension: " + IStr(PARAM_EXT_TEMP) +
+          "°C for " + IStr(PARAM_FINAL_EXT_TIME) + " s");
+    HSLInhecoTEC.SetTemperature(PARAM_EXT_TEMP);
+    HSLInhecoTEC.WaitForTemperature(PARAM_EXT_TEMP, 60);
+    HSLUtilLib.Delay(PARAM_FINAL_EXT_TIME);
+
+    // ---- Cool to 4 °C and deactivate lid heater ----
+    Trace("Cooling to 4°C");
+    HSLInhecoTEC.SetLidTemperature(0);     // deactivate lid heater
+    HSLInhecoTEC.SetTemperature(4);
+    HSLInhecoTEC.WaitForTemperature(10, 300); // wait until ≤10°C, 5-min timeout
+    // Block stays active at 4°C until operator confirms pickup (MessageBox in main)
+}
+
+
+// ============================================================
+//  END OF METHOD FILE
+// ============================================================
