@@ -1,0 +1,857 @@
+// ============================================================
+//  Miniprep_Magbead_Hamilton.hsl
+//  Hamilton STAR / STARlet – Venus 4.4+
+//
+//  Ported from: Pellet-Free Minipreps with Magbeads (Flex, 8-Channel)
+//  Original authors: Gabriel Straface, Dan Voicu
+//                    (Ignea Lab @ McGill University)
+//
+//  Description:
+//    Pellet-free plasmid miniprep using magnetic beads.
+//    Per-sample reagent requirements:
+//      940  µL  culture (pre-loaded in deep-well plate)
+//      470  µL  lysis buffer
+//      239  µL  neutralization buffer
+//      301  µL  binding buffer
+//       40  µL  magnetic beads
+//      600  µL  wash (wash buffer allocation depends on wash protocol)
+//       30  µL  elution buffer
+//
+//  All pipetting is done channel-1-only (SINGLE tip mode equivalent).
+//  Each reagent transfer uses a fresh tip per well – same as original.
+//
+//  Deck layout (STARlet, tracks 1-30):
+//    Tracks  1-6  : TIP_CAR_480_A00 → 2× HTF 1000 µL filter tips
+//                                       (tip racks: Tips_1000_1, Tips_1000_2)
+//    Tracks  7-12 : TIP_CAR_480_A00 → 2× STF 50 µL filter tips
+//                                       (tip racks: Tips_50_1, Tips_50_2)
+//    Tracks 13-15 : SMP_CAR_24_A00  → 1.5 mL tube rack (small reagents)
+//    Tracks 16-18 : DW96_CAR_P2_A00 → Deep-well plate carrier (initial + mag plate, 2 sites)
+//    Tracks 19-21 : HHS_CAR_A00     → Heater-Shaker (HHS) carrier
+//    Tracks 22-27 : RES12_CAR_A00   → 12-well 22 mL reservoir
+//    Tracks 28-30 : PCR_CAR_A00     → Elution PCR plate
+//
+//  Reagent map:
+//    Tube rack (SMP_CAR_24):
+//      A1 = Magnetic beads
+//      A2 = Elution buffer
+//      A3 = Lysis buffer concentrate  (regular wells only)
+//      A4 = Neutralization buffer concentrate (regular wells only)
+//
+//    Reservoir (12-well, 22 mL):
+//      A1 = Lysis buffer         (concentrated wells)
+//      A2 = Neutralization buffer (concentrated wells)
+//      A3 = Binding buffer
+//      A4 = PB wash buffer
+//      A5 = PE wash buffer
+//      A6 = Ethanol wash buffer
+//
+//  Waste:
+//    Hamilton waste chute or a dedicated waste trough on the deck.
+//    Set WASTE_LABWARE and WASTE_WELL to match your configuration.
+//
+//  Sequences (must be defined in Miniprep_Magbead_Hamilton.lay):
+//    seqTips_1000_1 / _2  – 1000 µL tip racks (seqTips_1000_2 is spare)
+//    seqTips_50_1   / _2  – 50 µL tip racks
+//    seqMagbeads          – tube rack A1
+//    seqElutionBuf        – tube rack A2
+//    seqLysisConc         – tube rack A3
+//    seqNeutConc          – tube rack A4
+//    seqLysis             – reservoir A1
+//    seqNeut              – reservoir A2
+//    seqBindBuf           – reservoir A3
+//    seqPB                – reservoir A4
+//    seqPE                – reservoir A5
+//    seqEthanol           – reservoir A6
+//    seqInitialPlate      – full 96-well deep-well plate (initial plate, site 1)
+//    seqMagPlate          – full 96-well deep-well plate (mag plate, site 2 or HHS)
+//    seqElutePlate        – full 96-well PCR elution plate
+//    seqWaste             – waste trough / chute target sequence
+//
+//  Liquid classes used:
+//    LC_1000_Aqueous_JetEmpty  – for all 1000 µL tip transfers
+//    LC_50_Aqueous_JetEmpty    – for all 50 µL tip transfers
+//    (Clone from HighVolumeFilter / StandardVolume Water classes; tune for
+//     your actual reagents – especially viscous lysis/neutralization buffers.)
+//
+//  Instrument notes:
+//    • Hamilton HHS (Heater-Shaker) replaces the Flex heater-shaker module.
+//      Driver: HslHamHeaterShakerLib.hsl (bundled with Venus).
+//    • The magnetic block is a static on-deck position (DWP site 2).
+//      Hamilton does not have an active magnetic module equivalent;
+//      the plate simply sits on a compatible strong permanent magnet
+//      block (e.g., Hamilton MagDeck or equivalent ALPAQUA block).
+//    • iSWAP arm moves the plate between the magnetic block position
+//      and the HHS.  Declare both as iSWAP-compatible positions in
+//      the deck layout.
+//    • No on-deck thermocycler is used in this protocol.
+// ============================================================
+
+// ── Include libraries ────────────────────────────────────────
+#include "HSLSeqLib.hsl"
+#include "HSLStrLib.hsl"
+#include "HSLUtilLib.hsl"
+#include "HslHamHeaterShakerLib.hsl"
+#include "HSLFileLib.hsl"   // Optional: for future CSV-based well selection
+
+
+// ── Constants ───────────────────────────────────────────────
+
+// Liquid class names – update these strings if you rename them
+variable LC_1000 = "HighVolumeFilter_Water_DispenseJet_Empty";
+variable LC_50   = "StandardVolume_Water_DispenseJet_Empty";
+
+// Reservoir height tracking (mL remaining → aspirate height offset)
+// These must be updated as each reagent is consumed.
+// Initial volume loaded per reservoir well: 15 mL
+variable avail_lysis      = 15.0;
+variable avail_neut       = 15.0;
+variable avail_binding    = 15.0;
+variable avail_PB         = 15.0;
+variable avail_PE         = 15.0;
+variable avail_ethanol    = 15.0;
+
+// Protocol volumes (µL) – match the original constants
+variable SAMPLE_VOLUME    = 940;  // grows as reagents are added
+variable LYSIS_AMOUNT     = 470;
+variable NEUT_AMOUNT      = 239;
+variable BIND_AMOUNT      = 301;
+variable BEAD_VOL         = 40;
+variable WASH_VOL         = 300;
+variable ELUTION_VOL      = 30;
+variable DEPTH_OFFSET     = 2;    // mm above bottom for supernatant removal
+                                  // (analogous to Opentrons top(-39))
+
+// Tip position counters (1-based, column-major within each rack)
+variable tipPos_1000 = 1;
+variable tipPos_50   = 1;
+
+// Well arrays – set these to match your sample_wells list
+// Must be column-major well names: "D1","D2",…  (row letter + column number)
+variable SAMPLE_WELLS[];
+variable N_SAMPLES = 11;
+
+// Per-well wash protocol assignment
+// 0 = two_wash (PB once + PE once)
+// 1 = PB_wash  (PB twice)
+// 2 = PE_wash  (PE twice)
+// 3 = eth_wash (EtOH twice)
+variable WASH_PROTOCOL[];
+
+// Categorisation flags per well
+// 0 = regular (uses tube-rack lysis/neut concentrate)
+// 1 = concentrated (uses reservoir lysis/neut)
+variable IS_CONC[];
+
+// Loop variables
+variable i;
+variable j;
+variable n_portions;
+variable remainder;
+variable well_name;
+
+// HHS device handle
+device hhs_device;
+
+
+// ============================================================
+//  MAIN METHOD
+// ============================================================
+method Miniprep_Magbead_Hamilton()
+{
+    // ── 0. Initialise well lists ─────────────────────────────
+    InitialiseWellData();
+
+    // ── 1. Instrument initialise ─────────────────────────────
+    // (Venus inserts auto-generated Initialize step in Method Editor)
+
+    // ── 2. Open HHS and verify mag plate position ────────────
+    HHS_Init();
+
+    // ── 3. Steps 1-2: Lysis and neutralization ──────────────
+    Step_Lysis();
+    Step_Neutralization();
+
+    // ── 4. Step 3: Add beads to mag plate ───────────────────
+    Step_AddBeads();
+
+    // ── 5. Step 4: Transfer samples to mag plate ────────────
+    Step_TransferToMagPlate();
+
+    // ── 6. Step 5: Add binding buffer ───────────────────────
+    Step_BindingBuffer();
+
+    // ── 7. Step 6: Incubate on HHS ──────────────────────────
+    Step_HHS_Incubate();
+
+    // ── 8. Step 7: Remove supernatant ───────────────────────
+    Step_RemoveSupernatant();
+
+    // ── 9. Step 8: Wash cycles ──────────────────────────────
+    Step_Wash();
+
+    // ── 10. Air dry ──────────────────────────────────────────
+    Trace("Air drying beads for 6 minutes...");
+    HSLUtilLib.Delay(360);   // 6 min in seconds
+
+    // ── 11. Step 9: Elution ──────────────────────────────────
+    Step_Elution();
+
+    // ── 12. Step 10: Transfer eluate to final plate ──────────
+    Step_TransferEluate();
+
+    // ── 13. Done ─────────────────────────────────────────────
+    HHS_Deactivate();
+    MessageBox("Miniprep complete!\nRetrieve elution plate from deck.", 0);
+}
+
+
+// ============================================================
+//  InitialiseWellData
+//  Hard-coded to match original sample_wells and protocol
+//  assignments.  Edit this submethod if your well list changes.
+// ============================================================
+submethod InitialiseWellData()
+{
+    // sample_wells = ['D1','D2','D3','E1','E2','E3','E4','F1','F2','F3','F4']
+    SAMPLE_WELLS[0]  = "D1";  WASH_PROTOCOL[0]  = 0;  IS_CONC[0]  = 0;  // regular, two_wash
+    SAMPLE_WELLS[1]  = "D2";  WASH_PROTOCOL[1]  = 0;  IS_CONC[1]  = 0;  // regular, two_wash
+    SAMPLE_WELLS[2]  = "D3";  WASH_PROTOCOL[2]  = 0;  IS_CONC[2]  = 0;  // regular, two_wash
+    SAMPLE_WELLS[3]  = "E1";  WASH_PROTOCOL[3]  = 0;  IS_CONC[3]  = 1;  // conc, two_wash
+    SAMPLE_WELLS[4]  = "E2";  WASH_PROTOCOL[4]  = 1;  IS_CONC[4]  = 1;  // conc, PB_wash
+    SAMPLE_WELLS[5]  = "E3";  WASH_PROTOCOL[5]  = 2;  IS_CONC[5]  = 1;  // conc, PE_wash
+    SAMPLE_WELLS[6]  = "E4";  WASH_PROTOCOL[6]  = 3;  IS_CONC[6]  = 1;  // conc, eth_wash
+    SAMPLE_WELLS[7]  = "F1";  WASH_PROTOCOL[7]  = 0;  IS_CONC[7]  = 1;  // conc, two_wash
+    SAMPLE_WELLS[8]  = "F2";  WASH_PROTOCOL[8]  = 1;  IS_CONC[8]  = 1;  // conc, PB_wash
+    SAMPLE_WELLS[9]  = "F3";  WASH_PROTOCOL[9]  = 2;  IS_CONC[9]  = 1;  // conc, PE_wash
+    SAMPLE_WELLS[10] = "F4";  WASH_PROTOCOL[10] = 3;  IS_CONC[10] = 1;  // conc, eth_wash
+}
+
+
+// ============================================================
+//  HHS helpers
+// ============================================================
+submethod HHS_Init()
+{
+    HslHamHeaterShakerLib.CreateUSBDevice(hhs_device, 0);  // USB port index 0
+    HslHamHeaterShakerLib.PowerOn(hhs_device);
+    HslHamHeaterShakerLib.OpenLatch(hhs_device);
+    Trace("HHS initialised and latch open.");
+}
+
+submethod HHS_Deactivate()
+{
+    HslHamHeaterShakerLib.StopShaker(hhs_device);
+    HslHamHeaterShakerLib.OpenLatch(hhs_device);
+    HslHamHeaterShakerLib.PowerOff(hhs_device);
+}
+
+
+// ============================================================
+//  ReservoirHeight
+//  Converts remaining volume in a 22 mL reservoir well (mL)
+//  to an aspirate height parameter (mm from bottom).
+//  Mirrors the original reservoir_vol_to_height() function:
+//    height = -2.5 * vol_mL + 50
+//  Returns the height value to pass to the Aspirate step's
+//  "liquid height from bottom" parameter.
+// ============================================================
+function ReservoirHeight(variable vol_mL) variable
+{
+    variable h;
+    h = (-2.5 * vol_mL) + 50.0;
+    if (h < 1.0) { h = 1.0; }   // safety floor
+    return h;
+}
+
+
+// ============================================================
+//  TipPickUp_1000 / TipPickUp_50
+//  Advances the tip counter and picks up one 1000 or 50 µL tip
+//  on channel 1.  Pauses if a rack is exhausted.
+// ============================================================
+submethod TipPickUp_1000()
+{
+    SeqLib.SeqSetCurrentPosition(seqTips_1000_1, tipPos_1000);
+    ML_STAR.Tip_Pick_Up(seqTips_1000_1, LC_1000, 1, 0);
+    tipPos_1000 = tipPos_1000 + 1;
+
+    if (tipPos_1000 > 96)
+    {
+        // Rack 1 exhausted – switch to rack 2
+        tipPos_1000 = 1;
+        SeqLib.SeqSetCurrentPosition(seqTips_1000_2, tipPos_1000);
+        MessageBox("1000 µL tip rack 1 empty – rack 2 now in use.\n" +
+                   "Replace rack 1 when convenient.", 0);
+    }
+}
+
+submethod TipEject_1000()
+{
+    ML_STAR.Tip_Eject(seqTips_1000_1, 1, 0);
+}
+
+submethod TipPickUp_50()
+{
+    SeqLib.SeqSetCurrentPosition(seqTips_50_1, tipPos_50);
+    ML_STAR.Tip_Pick_Up(seqTips_50_1, LC_50, 1, 0);
+    tipPos_50 = tipPos_50 + 1;
+
+    if (tipPos_50 > 96)
+    {
+        tipPos_50 = 1;
+        SeqLib.SeqSetCurrentPosition(seqTips_50_2, tipPos_50);
+        MessageBox("50 µL tip rack 1 empty – rack 2 now in use.\n" +
+                   "Replace rack 1 when convenient.", 0);
+    }
+}
+
+submethod TipEject_50()
+{
+    ML_STAR.Tip_Eject(seqTips_50_1, 1, 0);
+}
+
+
+// ============================================================
+//  Aspirate / Dispense wrappers
+//  These call the ML STAR 1000 µL channel aspirate/dispense
+//  with channel-1-only pattern and a fixed liquid height.
+//  liq_height = mm above container bottom (0 = use default).
+// ============================================================
+submethod Asp1000(sequence src, variable vol, variable liq_height)
+{
+    SeqLib.SeqSetCurrentPosition(src, 1);
+    ML_STAR.Aspirate(src, vol, LC_1000, 1, 0, 0, liq_height);
+}
+
+submethod Disp1000(sequence dst, variable vol)
+{
+    SeqLib.SeqSetCurrentPosition(dst, 1);
+    ML_STAR.Dispense(dst, vol, LC_1000, 1, 0, 0, 0, 0);
+}
+
+submethod Asp50(sequence src, variable vol, variable liq_height)
+{
+    SeqLib.SeqSetCurrentPosition(src, 1);
+    ML_STAR.Aspirate(src, vol, LC_50, 1, 0, 0, liq_height);
+}
+
+submethod Disp50(sequence dst, variable vol)
+{
+    SeqLib.SeqSetCurrentPosition(dst, 1);
+    ML_STAR.Dispense(dst, vol, LC_50, 1, 0, 0, 0, 0);
+}
+
+// ─ Convenience: aspirate and dispense to waste ──────────────
+submethod Waste1000(sequence src, variable vol, variable liq_height)
+{
+    Asp1000(src, vol, liq_height);
+    Disp1000(seqWaste, vol);
+}
+
+submethod Waste50(sequence src, variable vol, variable liq_height)
+{
+    Asp50(src, vol, liq_height);
+    Disp50(seqWaste, vol);
+}
+
+
+// ============================================================
+//  WellSeq
+//  Returns a temporary single-well sequence pointing to
+//  <well_name> on the given plate sequence labware name.
+//  In HSL you cannot index a sequence by well name at runtime
+//  the way Python indexes a plate object; instead, use
+//  SeqLib.SeqAdd with the labware name and position ID.
+//  Caller is responsible for resetting current position to 1.
+// ============================================================
+function WellSeq(variable labware_name, variable well_name) sequence
+{
+    sequence s;
+    SeqLib.SeqSetCount(s, 0);
+    SeqLib.SeqAdd(s, labware_name, well_name);
+    SeqLib.SeqSetCurrentPosition(s, 1);
+    return s;
+}
+
+
+// ============================================================
+//  STEP 1 – Lysis Buffer
+//  regular_wells: from tube rack A3 (lysis concentrate), 250 µL
+//  conc_wells:    from reservoir A1, LYSIS_AMOUNT µL (in 300 µL portions)
+// ============================================================
+submethod Step_Lysis()
+{
+    sequence src_seq;
+    sequence dst_seq;
+    variable portions;
+    variable rem;
+
+    Trace("Step 1: Adding lysis buffer...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        dst_seq   = WellSeq("InitialPlate", well_name);
+
+        if (IS_CONC[i] == 0)
+        {
+            // Regular wells – 250 µL from tube rack A3
+            TipPickUp_50();
+            Asp50(seqLysisConc, 250, 0);
+            Disp50(dst_seq, 250);
+            // mix_after(1, 200) – 1 cycle, 200 µL
+            ML_STAR.Mix(dst_seq, 200, LC_50, 1, 0, 1);
+            ML_STAR.Blowout(dst_seq, LC_50, 1, 0);
+            TipEject_50();
+        }
+        else
+        {
+            // Concentrated wells – LYSIS_AMOUNT µL from reservoir A1 in ≤300 µL portions
+            TipPickUp_1000();
+            portions = LYSIS_AMOUNT / 300;
+            rem      = LYSIS_AMOUNT - (portions * 300);
+
+            for (j = 0; j < portions; j++)
+            {
+                Asp1000(seqLysis, 300, ReservoirHeight(avail_lysis));
+                Disp1000(dst_seq, 300);
+                avail_lysis = avail_lysis - 0.3;
+            }
+            if (rem > 0)
+            {
+                Asp1000(seqLysis, rem, ReservoirHeight(avail_lysis));
+                Disp1000(dst_seq, rem);
+                avail_lysis = avail_lysis - (rem / 1000.0);
+            }
+
+            // mix(1, 300)
+            ML_STAR.Mix(dst_seq, 300, LC_1000, 1, 0, 1);
+            ML_STAR.Blowout(dst_seq, LC_1000, 1, 0);
+            TipEject_1000();
+        }
+    }
+
+    SAMPLE_VOLUME = SAMPLE_VOLUME + LYSIS_AMOUNT;
+
+    // Incubation: original delays (300 – 60×N_SAMPLES) seconds if positive
+    variable incubation_s;
+    incubation_s = 300 - (60 * N_SAMPLES);
+    if (incubation_s > 0)
+    {
+        Trace("Lysis incubation: " + IStr(incubation_s) + " seconds...");
+        HSLUtilLib.Delay(incubation_s);
+    }
+}
+
+
+// ============================================================
+//  STEP 2 – Neutralization Buffer
+//  regular_wells: from tube rack A4, 250 µL
+//  conc_wells:    from reservoir A2, NEUT_AMOUNT µL
+// ============================================================
+submethod Step_Neutralization()
+{
+    sequence dst_seq;
+    variable portions;
+    variable rem;
+
+    Trace("Step 2: Adding neutralization buffer...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        dst_seq   = WellSeq("InitialPlate", well_name);
+
+        if (IS_CONC[i] == 0)
+        {
+            TipPickUp_50();
+            Asp50(seqNeutConc, 250, 0);
+            Disp50(dst_seq, 250);
+            ML_STAR.Mix(dst_seq, 200, LC_50, 1, 0, 5);   // mix(5, 200)
+            ML_STAR.Blowout(dst_seq, LC_50, 1, 0);
+            TipEject_50();
+        }
+        else
+        {
+            TipPickUp_1000();
+            portions = NEUT_AMOUNT / 300;
+            rem      = NEUT_AMOUNT - (portions * 300);
+
+            for (j = 0; j < portions; j++)
+            {
+                Asp1000(seqNeut, 300, ReservoirHeight(avail_neut));
+                Disp1000(dst_seq, 300);
+                avail_neut = avail_neut - 0.3;
+            }
+            if (rem > 0)
+            {
+                Asp1000(seqNeut, rem, ReservoirHeight(avail_neut));
+                Disp1000(dst_seq, rem);
+                avail_neut = avail_neut - (rem / 1000.0);
+            }
+
+            ML_STAR.Mix(dst_seq, 300, LC_1000, 1, 0, 2);   // mix(2, 300)
+            ML_STAR.Blowout(dst_seq, LC_1000, 1, 0);
+            TipEject_1000();
+        }
+    }
+
+    SAMPLE_VOLUME = SAMPLE_VOLUME + NEUT_AMOUNT;
+
+    // Incubate 10 minutes
+    Trace("Neutralization incubation: 10 minutes...");
+    HSLUtilLib.Delay(600);
+}
+
+
+// ============================================================
+//  STEP 3 – Add Magnetic Beads to Mag Plate
+//  40 µL beads per well; mix 3× before each transfer.
+//  Uses 50 µL tips.
+// ============================================================
+submethod Step_AddBeads()
+{
+    sequence dst_seq;
+
+    Trace("Step 3: Adding magnetic beads to mag plate...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        dst_seq   = WellSeq("MagPlate", well_name);
+
+        TipPickUp_50();
+
+        // Mix beads 3× before aspirating (resuspend)
+        ML_STAR.Mix(seqMagbeads, 40, LC_50, 1, 0, 3);
+
+        // Aspirate and dispense
+        Asp50(seqMagbeads, BEAD_VOL, 0);
+        Disp50(dst_seq, BEAD_VOL);
+        ML_STAR.Blowout(dst_seq, LC_50, 1, 0);
+
+        TipEject_50();
+    }
+}
+
+
+// ============================================================
+//  STEP 4 – Transfer Samples to Mag Plate
+//  Large volumes: transfer in ≤300 µL portions per well.
+//  Uses 1000 µL tips.
+// ============================================================
+submethod Step_TransferToMagPlate()
+{
+    sequence src_seq;
+    sequence dst_seq;
+    variable portions;
+    variable rem;
+
+    Trace("Step 4: Transferring samples to mag plate...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        src_seq   = WellSeq("InitialPlate", well_name);
+        dst_seq   = WellSeq("MagPlate",     well_name);
+
+        TipPickUp_1000();
+
+        portions = SAMPLE_VOLUME / 300;
+        rem      = SAMPLE_VOLUME - (portions * 300);
+
+        for (j = 0; j < portions; j++)
+        {
+            Asp1000(src_seq, 300, DEPTH_OFFSET);
+            Disp1000(dst_seq, 300);
+        }
+        if (rem > 0)
+        {
+            Asp1000(src_seq, rem, DEPTH_OFFSET);
+            Disp1000(dst_seq, rem);
+            // mix_after(2, 300) on last transfer
+            ML_STAR.Mix(dst_seq, 300, LC_1000, 1, 0, 2);
+        }
+
+        ML_STAR.Blowout(dst_seq, LC_1000, 1, 0);
+        TipEject_1000();
+    }
+
+    SAMPLE_VOLUME = SAMPLE_VOLUME + BEAD_VOL;
+}
+
+
+// ============================================================
+//  STEP 5 – Add Binding Buffer
+//  301 µL per well from reservoir A3, in ≤300 µL portions.
+// ============================================================
+submethod Step_BindingBuffer()
+{
+    sequence dst_seq;
+    variable portions;
+    variable rem;
+
+    Trace("Step 5: Adding binding buffer...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        dst_seq   = WellSeq("MagPlate", well_name);
+
+        TipPickUp_1000();
+
+        portions = BIND_AMOUNT / 300;
+        rem      = BIND_AMOUNT - (portions * 300);
+
+        for (j = 0; j < portions; j++)
+        {
+            Asp1000(seqBindBuf, 300, ReservoirHeight(avail_binding));
+            Disp1000(dst_seq, 300);
+            avail_binding = avail_binding - 0.3;
+        }
+        if (rem > 0)
+        {
+            Asp1000(seqBindBuf, rem, ReservoirHeight(avail_binding));
+            Disp1000(dst_seq, rem);
+            avail_binding = avail_binding - (rem / 1000.0);
+            ML_STAR.Mix(dst_seq, 300, LC_1000, 1, 0, 3);   // mix_after(3, 300)
+        }
+
+        TipEject_1000();
+    }
+
+    SAMPLE_VOLUME = SAMPLE_VOLUME + BIND_AMOUNT;
+}
+
+
+// ============================================================
+//  STEP 6 – Incubate on Heater-Shaker (5 minutes, 1000 rpm)
+//  iSWAP moves mag plate to HHS, shakes, then returns to mag block.
+// ============================================================
+submethod Step_HHS_Incubate()
+{
+    Trace("Step 6: Moving plate to HHS for bead incubation...");
+
+    // iSWAP: pick up mag plate from magnetic block position → HHS
+    // (Venus inserts Move_Plate / iSWAP steps in Method Editor GUI;
+    //  in raw HSL the call below is the equivalent)
+    ML_STAR.iSWAP_Move_Plate(
+        "MagPlate_MagBlock_Seq",   // source sequence (deck position of mag block)
+        "MagPlate_HHS_Seq",        // destination sequence (deck position of HHS)
+        0,                         // cover handling: 0 = no cover
+        0,                         // grip width fine-tune
+        0                          // place height fine-tune
+    );
+
+    HslHamHeaterShakerLib.CloseLatch(hhs_device);
+    HslHamHeaterShakerLib.StartShaker(hhs_device, 1000);   // 1000 rpm
+
+    Trace("Shaking for 5 minutes...");
+    HSLUtilLib.Delay(300);   // 5 min
+
+    HslHamHeaterShakerLib.StopShaker(hhs_device);
+    HslHamHeaterShakerLib.OpenLatch(hhs_device);
+
+    Trace("Returning plate to magnetic block...");
+    ML_STAR.iSWAP_Move_Plate(
+        "MagPlate_HHS_Seq",
+        "MagPlate_MagBlock_Seq",
+        0, 0, 0
+    );
+
+    // Allow beads to settle: 90 seconds
+    Trace("Waiting 90 s for beads to settle...");
+    HSLUtilLib.Delay(90);
+}
+
+
+// ============================================================
+//  STEP 7 – Remove Supernatant to Waste
+//  Aspirates in ≤300 µL portions from DEPTH_OFFSET above bottom.
+// ============================================================
+submethod Step_RemoveSupernatant()
+{
+    sequence src_seq;
+    variable portions;
+    variable rem;
+
+    Trace("Step 7: Removing supernatant...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        src_seq   = WellSeq("MagPlate", well_name);
+
+        TipPickUp_1000();
+
+        portions = SAMPLE_VOLUME / 300;
+        rem      = SAMPLE_VOLUME - (portions * 300);
+
+        for (j = 0; j < portions; j++)
+        {
+            Waste1000(src_seq, 300, DEPTH_OFFSET);
+        }
+        if (rem > 0)
+        {
+            Waste1000(src_seq, rem, DEPTH_OFFSET);
+        }
+
+        TipEject_1000();
+    }
+}
+
+
+// ============================================================
+//  PerformWash
+//  Adds 300 µL wash buffer, delays 15 s, removes to waste,
+//  then removes residual 20 µL with a 50 µL tip.
+//  wash_type: 0=PB, 1=PE, 2=EtOH
+// ============================================================
+submethod PerformWash(variable well_name, variable wash_type)
+{
+    sequence src_seq;
+    sequence dst_seq;
+
+    dst_seq = WellSeq("MagPlate", well_name);
+    src_seq = WellSeq("MagPlate", well_name);
+
+    // Select buffer sequence and decrement tracker
+    if (wash_type == 0)
+    {
+        TipPickUp_1000();
+        Asp1000(seqPB, WASH_VOL, ReservoirHeight(avail_PB));
+        Disp1000(dst_seq, WASH_VOL);
+        ML_STAR.Mix(dst_seq, 200, LC_1000, 1, 0, 3);
+        avail_PB = avail_PB - (WASH_VOL / 1000.0);
+    }
+    else if (wash_type == 1)
+    {
+        TipPickUp_1000();
+        Asp1000(seqPE, WASH_VOL, ReservoirHeight(avail_PE));
+        Disp1000(dst_seq, WASH_VOL);
+        ML_STAR.Mix(dst_seq, 200, LC_1000, 1, 0, 3);
+        avail_PE = avail_PE - (WASH_VOL / 1000.0);
+    }
+    else  // EtOH
+    {
+        TipPickUp_1000();
+        Asp1000(seqEthanol, WASH_VOL, ReservoirHeight(avail_ethanol));
+        Disp1000(dst_seq, WASH_VOL);
+        ML_STAR.Mix(dst_seq, 200, LC_1000, 1, 0, 3);
+        avail_ethanol = avail_ethanol - (WASH_VOL / 1000.0);
+    }
+
+    // 15-second incubation
+    HSLUtilLib.Delay(15);
+
+    // Remove wash to waste
+    Waste1000(src_seq, WASH_VOL, DEPTH_OFFSET);
+    TipEject_1000();
+
+    // Residual removal with 50 µL tip
+    TipPickUp_50();
+    Waste50(src_seq, 20, DEPTH_OFFSET);
+    TipEject_50();
+}
+
+
+// ============================================================
+//  STEP 8 – Wash Cycles
+//  Dispatch each well to its assigned wash protocol.
+// ============================================================
+submethod Step_Wash()
+{
+    Trace("Step 8: Performing wash cycles...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+
+        if (WASH_PROTOCOL[i] == 0)
+        {
+            // two_wash: PB once, then PE once
+            PerformWash(well_name, 0);   // PB
+            PerformWash(well_name, 1);   // PE
+        }
+        else if (WASH_PROTOCOL[i] == 1)
+        {
+            // PB_wash: PB twice
+            PerformWash(well_name, 0);
+            PerformWash(well_name, 0);
+        }
+        else if (WASH_PROTOCOL[i] == 2)
+        {
+            // PE_wash: PE twice
+            PerformWash(well_name, 1);
+            PerformWash(well_name, 1);
+        }
+        else
+        {
+            // eth_wash: EtOH twice
+            PerformWash(well_name, 2);
+            PerformWash(well_name, 2);
+        }
+    }
+}
+
+
+// ============================================================
+//  STEP 9 – Elution
+//  30 µL elution buffer per well; mix 5×, blow out.
+// ============================================================
+submethod Step_Elution()
+{
+    sequence dst_seq;
+
+    Trace("Step 9: Adding elution buffer...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        dst_seq   = WellSeq("MagPlate", well_name);
+
+        TipPickUp_50();
+        Asp50(seqElutionBuf, ELUTION_VOL, 0);
+        Disp50(dst_seq, ELUTION_VOL);
+        ML_STAR.Mix(dst_seq, 10, LC_50, 1, 0, 5);      // mix_after(5, 10)
+        ML_STAR.Blowout(dst_seq, LC_50, 1, 0);
+        TipEject_50();
+    }
+
+    // Incubate 2 min + 1 min bead settle
+    Trace("Elution incubation: 3 minutes...");
+    HSLUtilLib.Delay(180);
+}
+
+
+// ============================================================
+//  STEP 10 – Transfer Eluate to Final Plate
+//  30 µL from mag plate to elution plate, fresh tip each well.
+// ============================================================
+submethod Step_TransferEluate()
+{
+    sequence src_seq;
+    sequence dst_seq;
+
+    Trace("Step 10: Transferring eluate to final plate...");
+
+    for (i = 0; i < N_SAMPLES; i++)
+    {
+        well_name = SAMPLE_WELLS[i];
+        src_seq   = WellSeq("MagPlate",   well_name);
+        dst_seq   = WellSeq("ElutePlate", well_name);
+
+        TipPickUp_50();
+        Asp50(src_seq, ELUTION_VOL, DEPTH_OFFSET);
+        Disp50(dst_seq, ELUTION_VOL);
+        TipEject_50();
+    }
+
+    Trace("Miniprep complete.");
+}
+
+
+// ============================================================
+//  END OF METHOD FILE
+// ============================================================
