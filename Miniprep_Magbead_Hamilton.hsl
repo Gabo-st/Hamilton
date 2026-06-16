@@ -123,8 +123,10 @@ variable DEPTH_OFFSET     = 2;    // mm above bottom for supernatant removal
                                   // (analogous to Opentrons top(-39))
 
 // Tip position counters (1-based, column-major within each rack)
-variable tipPos_1000 = 1;
-variable tipPos_50   = 1;
+variable tipPos_1000  = 1;
+variable tipPos_50    = 1;
+variable tipRack_1000 = 1;   // 1 = rack 1 active, 2 = rack 2 active
+variable tipRack_50   = 1;
 
 // Well arrays – set these to match your sample_wells list
 // Must be column-major well names: "D1","D2",…  (row letter + column number)
@@ -272,17 +274,33 @@ function ReservoirHeight(variable vol_mL) variable
 // ============================================================
 submethod TipPickUp_1000()
 {
-    SeqLib.SeqSetCurrentPosition(seqTips_1000_1, tipPos_1000);
-    ML_STAR.Tip_Pick_Up(seqTips_1000_1, LC_1000, 1, 0);
+    if (tipRack_1000 == 1)
+    {
+        SeqLib.SeqSetCurrentPosition(seqTips_1000_1, tipPos_1000);
+        ML_STAR.Tip_Pick_Up(seqTips_1000_1, LC_1000, 1, 0);
+    }
+    else
+    {
+        SeqLib.SeqSetCurrentPosition(seqTips_1000_2, tipPos_1000);
+        ML_STAR.Tip_Pick_Up(seqTips_1000_2, LC_1000, 1, 0);
+    }
     tipPos_1000 = tipPos_1000 + 1;
 
     if (tipPos_1000 > 96)
     {
-        // Rack 1 exhausted – switch to rack 2
         tipPos_1000 = 1;
-        SeqLib.SeqSetCurrentPosition(seqTips_1000_2, tipPos_1000);
-        MessageBox("1000 µL tip rack 1 empty – rack 2 now in use.\n" +
-                   "Replace rack 1 when convenient.", 0);
+        if (tipRack_1000 == 1)
+        {
+            tipRack_1000 = 2;
+            MessageBox("1000 µL tip rack 1 empty – rack 2 now in use.\n" +
+                       "Replace rack 1 when convenient.", 0);
+        }
+        else
+        {
+            MessageBox("ERROR: All 1000 µL tips exhausted!\n" +
+                       "Reload both tip racks and restart.", 16);
+            AbortMethod();
+        }
     }
 }
 
@@ -293,16 +311,33 @@ submethod TipEject_1000()
 
 submethod TipPickUp_50()
 {
-    SeqLib.SeqSetCurrentPosition(seqTips_50_1, tipPos_50);
-    ML_STAR.Tip_Pick_Up(seqTips_50_1, LC_50, 1, 0);
+    if (tipRack_50 == 1)
+    {
+        SeqLib.SeqSetCurrentPosition(seqTips_50_1, tipPos_50);
+        ML_STAR.Tip_Pick_Up(seqTips_50_1, LC_50, 1, 0);
+    }
+    else
+    {
+        SeqLib.SeqSetCurrentPosition(seqTips_50_2, tipPos_50);
+        ML_STAR.Tip_Pick_Up(seqTips_50_2, LC_50, 1, 0);
+    }
     tipPos_50 = tipPos_50 + 1;
 
     if (tipPos_50 > 96)
     {
         tipPos_50 = 1;
-        SeqLib.SeqSetCurrentPosition(seqTips_50_2, tipPos_50);
-        MessageBox("50 µL tip rack 1 empty – rack 2 now in use.\n" +
-                   "Replace rack 1 when convenient.", 0);
+        if (tipRack_50 == 1)
+        {
+            tipRack_50 = 2;
+            MessageBox("50 µL tip rack 1 empty – rack 2 now in use.\n" +
+                       "Replace rack 1 when convenient.", 0);
+        }
+        else
+        {
+            MessageBox("ERROR: All 50 µL tips exhausted!\n" +
+                       "Reload both tip racks and restart.", 16);
+            AbortMethod();
+        }
     }
 }
 
